@@ -1,101 +1,135 @@
 export default async function handler(req, res) {
-  // --- CORS ---
+  // --- CORS (para preflight y para que cualquier cliente pueda pegarle) ---
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
 
   try {
-    const { userName, password, phoneNumber, currencyCode } = req.body || {};
+    const {
+      userName = "",
+      password = "",
+      phoneNumber = "",
+      currencyCode = ""
+    } = req.body || {};
 
-    if (!userName || !password) {
-      return res.status(400).json({ ok: false, error: "Missing userName/password" });
+    // Variables de entorno (Vercel)
+    const CHATWOOT_BASE_URL = process.env.CHATWOOT_BASE_URL || "https://app.chatwoot.com";
+    const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
+    const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID;
+    const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN;
+
+    if (!CHATWOOT_ACCOUNT_ID || !CHATWOOT_INBOX_ID || !CHATWOOT_API_TOKEN) {
+      return res.status(500).json({
+        ok: false,
+        error: "Missing env vars",
+        missing: {
+          CHATWOOT_ACCOUNT_ID: !CHATWOOT_ACCOUNT_ID,
+          CHATWOOT_INBOX_ID: !CHATWOOT_INBOX_ID,
+          CHATWOOT_API_TOKEN: !CHATWOOT_API_TOKEN
+        }
+      });
     }
 
-    const CHATWOOT_BASE_URL = process.env.CHATWOOT_BASE_URL; // ej: https://app.chatwoot.com
-    const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID; // ej: 148466
-    const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID; // ej: 91814
-    const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN; // el token de Chatwoot
-
-    if (!CHATWOOT_BASE_URL || !CHATWOOT_ACCOUNT_ID || !CHATWOOT_INBOX_ID || !CHATWOOT_API_TOKEN) {
-      return res.status(500).json({ ok: false, error: "Missing Chatwoot env vars" });
-    }
-
+    const apiBase = `${CHATWOOT_BASE_URL.replace(/\/$/, "")}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}`;
     const headers = {
       "Content-Type": "application/json",
-      api_access_token: CHATWOOT_API_TOKEN,
+      "api_access_token": CHATWOOT_API_TOKEN
     };
 
-    // 1) Crear/obtener contacto
-    const contactPayload = {
-      name: userName,
-      phone_number: phoneNumber || "",
-      identifier: userName,
-    };
+    // 1) Crear (o reutilizar) contacto
+    // phone_number suele servir bien para que Chatwoot lo identifique
+    const contactResp = await fetch(`${apiBase}/contacts`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        name: userName || phoneNumber || "Nuevo usuario",
+        phone_number: phoneNumber || undefined,
+        identifier: userName || undefined
+      })
+    });
 
-    const contactRes = await fetch(
-      `${CHATWOOT_BASE_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`,
-      { method: "POST", headers, body: JSON.stringify(contactPayload) }
-    );
-
-    const contactJson = await contactRes.json();
-    if (!contactRes.ok) {
-      return res.status(500).json({ ok: false, step: "create_contact", chatwoot: contactJson });
+    const contactData = await contactResp.json().catch(() => ({}));
+    if (!contactResp.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "create_contact",
+        status: contactResp.status,
+        chatwoot: contactData
+      });
     }
 
-    const contactId = contactJson?.payload?.contact?.id || contactJson?.id;
-
-    // 2) Crear conversación en inbox
-    const convRes = await fetch(
-      `${CHATWOOT_BASE_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          inbox_id: Number(CHATWOOT_INBOX_ID),
-          contact_id: Number(contactId),
-        }),
-      }
-    );
-
-    const convJson = await convRes.json();
-    if (!convRes.ok) {
-      return res.status(500).json({ ok: false, step: "create_conversation", chatwoot: convJson });
+    const contactId = contactData?.payload?.contact?.id || contactData?.id;
+    if (!contactId) {
+      return res.status(500).json({ ok: false, step: "contact_id_missing", chatwoot: contactData });
     }
 
-    const conversationId = convJson?.id;
+    // 2) Crear conversación en Inbox
+    const convResp = await fetch(`${apiBase}/conversations`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        inbox_id: Number(CHATWOOT_INBOX_ID),
+        contact_id: Number(contactId)
+      })
+    });
 
-    // 3) Mandar mensaje (nota: mandar password por chat es riesgoso)
-    const text =
-`✅ Usuario creado
+    const convData = await convResp.json().catch(() => ({}));
+    if (!convResp.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "create_conversation",
+        status: convResp.status,
+        chatwoot: convData
+      });
+    }
 
+    const conversationId = convData?.id || convData?.payload?.id;
+    if (!conversationId) {
+      return res.status(500).json({ ok: false, step: "conversation_id_missing", chatwoot: convData });
+    }
+
+    // 3) Mandar un mensaje interno (nota privada) con user + pass
+    const content =
+`🆕 Usuario creado desde panel
 👤 Usuario: ${userName}
 🔑 Password: ${password}
-📞 Tel: ${phoneNumber || "-"}
-💱 Moneda: ${currencyCode || "-"}`;
+📞 Tel: ${phoneNumber}
+💱 Moneda: ${currencyCode}`;
 
-    const msgRes = await fetch(
-      `${CHATWOOT_BASE_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          content: text,
-          message_type: "outgoing",
-          private: true, // para que quede como nota interna
-        }),
-      }
-    );
+    const msgResp = await fetch(`${apiBase}/conversations/${conversationId}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        content,
+        message_type: "outgoing",
+        private: true
+      })
+    });
 
-    const msgJson = await msgRes.json();
-    if (!msgRes.ok) {
-      return res.status(500).json({ ok: false, step: "send_message", chatwoot: msgJson });
+    const msgData = await msgResp.json().catch(() => ({}));
+    if (!msgResp.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "send_message",
+        status: msgResp.status,
+        chatwoot: msgData
+      });
     }
 
-    return res.status(200).json({ ok: true, conversationId });
+    return res.status(200).json({
+      ok: true,
+      contactId,
+      conversationId
+    });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 }
